@@ -8,4 +8,4 @@ COPY . /src
 
 EXPOSE 8080
 
-CMD ["python", "-m", "app"]
+CMD ["python", "main.py"]
