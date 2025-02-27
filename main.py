@@ -6,6 +6,7 @@ from urllib.parse import urljoin
 import logging
 from dotenv import load_dotenv
 import uvicorn
+import json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -14,6 +15,16 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Set debug mode from environment variable
+DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
+
+# Configure requests library logging when in debug mode
+if DEBUG:
+    # Enable HTTP request logging from the requests library
+    requests_logger = logging.getLogger('urllib3')
+    requests_logger.setLevel(logging.DEBUG)
+    requests_logger.propagate = True
 
 app = FastAPI(
     title="OpenAI API Proxy",
@@ -66,6 +77,16 @@ async def proxy(request: Request, path: str):
     # Get query parameters
     params = dict(request.query_params)
     
+    # Log detailed request information in debug mode
+    if DEBUG:
+        debug_info = {
+            "method": method,
+            "target_url": target_url,
+            "headers": {k: v for k, v in headers.items() if k.lower() not in ('authorization')},  # Don't log auth tokens
+            "params": params
+        }
+        logger.debug(f"Request details: {json.dumps(debug_info, indent=2)}")
+    
     try:
         # Common request kwargs
         request_kwargs = {
@@ -105,17 +126,43 @@ async def proxy(request: Request, path: str):
                     "files": files
                 })
                 
+                if DEBUG:
+                    logger.debug(f"Form data: {data}")
+                    logger.debug(f"Files: {[f for f in files.keys()]}")
+                
                 response = requests.request(method, target_url, **request_kwargs)
             else:
                 # Handle JSON or other content types
                 body = await request.body()
                 request_kwargs["data"] = body
                 
+                if DEBUG and body:
+                    try:
+                        # Try to parse and log the body if it's JSON
+                        if 'application/json' in content_type:
+                            body_json = json.loads(body)
+                            # Redact sensitive fields if present
+                            if 'messages' in body_json:
+                                logger.debug(f"Request body contains {len(body_json['messages'])} messages")
+                            else:
+                                logger.debug(f"Request body: {json.dumps(body_json, indent=2)}")
+                        else:
+                            logger.debug(f"Request body length: {len(body)}")
+                    except:
+                        logger.debug(f"Request body length: {len(body)}")
+                
                 response = requests.request(method, target_url, **request_kwargs)
+        
+        # Log response details in debug mode
+        if DEBUG:
+            logger.debug(f"Response status: {response.status_code}")
+            logger.debug(f"Response headers: {dict(response.headers)}")
         
         # Create a streaming response with the same status code and headers
         def generate_stream():
             for chunk in response.iter_content(chunk_size=1024):
+                if DEBUG:
+                    logger.debug(f"Streaming chunk: {len(chunk)} bytes")
                 yield chunk
         
         # Create response headers
@@ -138,10 +185,9 @@ async def proxy(request: Request, path: str):
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
     host = os.getenv('HOST', '0.0.0.0')
-    debug = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
     
     logger.info(f"Starting OpenAI API Proxy on {host}:{port}")
-    logger.info(f"Debug mode: {debug}")
+    logger.info(f"Debug mode: {DEBUG}")
     logger.info(f"Proxy enabled: {PROXY_CONFIG is not None}")
     
-    uvicorn.run("main:app", host=host, port=port, reload=debug)
+    uvicorn.run("main:app", host=host, port=port, reload=DEBUG)
