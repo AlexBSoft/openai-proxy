@@ -1,193 +1,220 @@
 import os
-import requests
-from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, Form, File
-from fastapi.responses import StreamingResponse
-from urllib.parse import urljoin
 import logging
-from dotenv import load_dotenv
+from typing import Any, Dict, Optional
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import StreamingResponse
 import uvicorn
-import json
+import requests
+from dotenv import load_dotenv
+import io
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO if os.getenv("DEBUG", "False").lower() == "true" else logging.WARNING,
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Set debug mode from environment variable
-DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
+# Get environment variables
+OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/")
+HTTP_PROXY = os.getenv("HTTP_PROXY")
+PORT = int(os.getenv("PORT", 8080))
 
-# Configure requests library logging when in debug mode
-if DEBUG:
-    # Enable HTTP request logging from the requests library
-    requests_logger = logging.getLogger('urllib3')
-    requests_logger.setLevel(logging.DEBUG)
-    requests_logger.propagate = True
+# Ensure OPENAI_API_BASE_URL ends with a slash
+if not OPENAI_API_BASE_URL.endswith("/"):
+    OPENAI_API_BASE_URL += "/"
 
-app = FastAPI(
-    title="OpenAI API Proxy",
-    description="A proxy server for OpenAI API that routes requests through a specified HTTP proxy",
-    version="1.0.0"
-)
-
-# OpenAI API base URL
-OPENAI_API_BASE_URL = os.getenv('OPENAI_API_BASE_URL', 'https://api.openai.com/')
-
-# Proxy configuration
-PROXY_CONFIG = None
-http_proxy = os.getenv('HTTP_PROXY')
-https_proxy = os.getenv('HTTPS_PROXY')
-
-if http_proxy:
-    PROXY_CONFIG = {
-        "http": http_proxy,
-        "https": https_proxy or http_proxy  # Use HTTP proxy for HTTPS if HTTPS proxy not specified
+# Configure proxy settings if HTTP_PROXY is set
+proxies = {}
+if HTTP_PROXY:
+    proxies = {
+        "http": HTTP_PROXY,
+        "https": HTTP_PROXY
     }
-    logger.info("Proxy configuration enabled")
+    logger.info(f"Using HTTP proxy: {HTTP_PROXY}")
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy(request: Request, path: str):
+app = FastAPI(title="OpenAI API Proxy")
+
+@app.get("/")
+async def root():
+    return {"message": "OpenAI API Proxy is running. Send your OpenAI API requests to this server."}
+
+async def handle_audio_transcription(request: Request):
     """
-    Proxy all requests to OpenAI API through the specified HTTP proxy.
-    
-    Args:
-        request: The incoming FastAPI request
-        path: The path part of the URL that will be appended to the base URL
-        
-    Returns:
-        StreamingResponse: The proxied response from the OpenAI API
-        
-    Raises:
-        HTTPException: If there's an error during the proxying process
+    Handle audio transcription requests to the OpenAI API.
     """
-    # Construct target URL
-    target_url = urljoin(OPENAI_API_BASE_URL, path)
-    logger.info(f"Proxying request to: {target_url}")
+    # Construct the target URL
+    target_url = f"{OPENAI_API_BASE_URL}v1/audio/transcriptions"
     
-    # Get request method
-    method = request.method
-    
-    # Get headers from the original request
+    # Get request headers
     headers = dict(request.headers)
-    if "host" in headers:
-        del headers["host"]
+    # Remove host header as it will be set by the requests library
+    headers.pop("host", None)
+    
+    logger.info("Handling audio transcription request")
+    
+    # Parse the multipart form data
+    form = await request.form()
+    
+    # Extract the file and model parameter
+    audio_file = None
+    model = "whisper-1"  # Default model
+    
+    for field_name, field_value in form.items():
+        if field_name == "file" and hasattr(field_value, "filename"):
+            # Get the audio file
+            audio_file = field_value
+            logger.info(f"Found audio file: {field_value.filename}")
+        elif field_name == "model":
+            # Get the model parameter
+            model = str(field_value)
+            logger.info(f"Using model: {model}")
+    
+    if not audio_file:
+        raise HTTPException(status_code=400, detail="No audio file provided")
+    
+    # Read the file content
+    file_content = await audio_file.read()
+    
+    # Create a multipart encoder
+    mp_encoder = MultipartEncoder(
+        fields={
+            'file': (audio_file.filename, io.BytesIO(file_content), audio_file.content_type or 'audio/mpeg'),
+            'model': model,
+        }
+    )
+    
+    # Update the content-type header
+    headers['Content-Type'] = mp_encoder.content_type
+    
+    # Make the request to OpenAI
+    logger.info(f"Sending request to {target_url}")
+    
+    try:
+        response = requests.post(
+            url=target_url,
+            headers=headers,
+            data=mp_encoder,
+            proxies=proxies if HTTP_PROXY else None,
+            timeout=60
+        )
+        
+        # Log the response for debugging
+        logger.info(f"Response status: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"Error response: {response.text}")
+        
+        # Return the response
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=dict(response.headers)
+        )
+    except requests.RequestException as e:
+        logger.error(f"Error proxying transcription request: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error proxying transcription request: {str(e)}")
+
+# Register the dedicated endpoint for audio transcriptions
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions_endpoint(request: Request):
+    return await handle_audio_transcription(request)
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"], include_in_schema=False)
+async def proxy(request: Request, path: str):
+    # Construct the target URL
+    target_url = f"{OPENAI_API_BASE_URL}{path}"
+    
+    # Get request headers
+    headers = dict(request.headers)
+    # Remove host header as it will be set by the requests library
+    headers.pop("host", None)
     
     # Get query parameters
     params = dict(request.query_params)
     
-    # Log detailed request information in debug mode
-    if DEBUG:
-        debug_info = {
-            "method": method,
-            "target_url": target_url,
-            "headers": {k: v for k, v in headers.items() if k.lower() not in ('authorization')},  # Don't log auth tokens
-            "params": params
-        }
-        logger.debug(f"Request details: {json.dumps(debug_info, indent=2)}")
-    
     try:
-        # Common request kwargs
-        request_kwargs = {
-            "headers": headers,
-            "params": params,
-            "stream": True
-        }
+        # Handle different content types appropriately
+        content_type = request.headers.get("content-type", "")
         
-        # Add proxy configuration if enabled
-        if PROXY_CONFIG:
-            request_kwargs["proxies"] = PROXY_CONFIG
-        
-        # Handle different request methods and content types
-        if method == 'GET':
-            response = requests.get(target_url, **request_kwargs)
-        else:  # POST, PUT, DELETE, etc.
-            content_type = headers.get('Content-Type', '')
+        if "multipart/form-data" in content_type:
+            # For multipart/form-data, we need to handle file uploads
+            form_data = await request.form()
+            files = {}
+            data = {}
             
-            if 'multipart/form-data' in content_type:
-                # For multipart form data, we need to handle it differently
-                form_data = await request.form()
-                files = {}
-                data = {}
-                
-                # Process form data
-                for key, value in form_data.items():
-                    if isinstance(value, UploadFile):
-                        # Handle file uploads
-                        file_content = await value.read()
-                        files[key] = (value.filename, file_content, value.content_type)
-                    else:
-                        # Handle regular form fields
-                        data[key] = value
-                
-                request_kwargs.update({
-                    "data": data,
-                    "files": files
-                })
-                
-                if DEBUG:
-                    logger.debug(f"Form data: {data}")
-                    logger.debug(f"Files: {[f for f in files.keys()]}")
-                
-                response = requests.request(method, target_url, **request_kwargs)
-            else:
-                # Handle JSON or other content types
-                body = await request.body()
-                request_kwargs["data"] = body
-                
-                if DEBUG and body:
-                    try:
-                        # Try to parse and log the body if it's JSON
-                        if 'application/json' in content_type:
-                            body_json = json.loads(body)
-                            # Redact sensitive fields if present
-                            if 'messages' in body_json:
-                                logger.debug(f"Request body contains {len(body_json['messages'])} messages")
-                            else:
-                                logger.debug(f"Request body: {json.dumps(body_json, indent=2)}")
-                        else:
-                            logger.debug(f"Request body length: {len(body)}")
-                    except:
-                        logger.debug(f"Request body length: {len(body)}")
-                
-                response = requests.request(method, target_url, **request_kwargs)
+            for field_name, field_value in form_data.items():
+                if hasattr(field_value, "filename") and field_value.filename:
+                    # This is a file
+                    # Instead of reading the file content, pass the file object directly
+                    # This preserves the file's content type and other metadata
+                    file_content = await field_value.read()
+                    content_type = field_value.content_type or "application/octet-stream"
+                    files[field_name] = (field_value.filename, file_content, content_type)
+                    logger.info(f"Processing file upload: {field_name}={field_value.filename} ({content_type})")
+                else:
+                    # This is a regular form field
+                    data[field_name] = str(field_value)
+                    logger.info(f"Processing form field: {field_name}={field_value}")
+            
+            # Log the request details for debugging
+            logger.info(f"Sending multipart request to {target_url}")
+            logger.info(f"Files: {[f'{k}={v[0]}' for k, v in files.items()]}")
+            logger.info(f"Data: {data}")
+            
+            # Make the request with files and form data
+            response = requests.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                params=params,
+                data=data,
+                files=files,
+                proxies=proxies if HTTP_PROXY else None,
+                stream=True,
+                verify=True,
+                allow_redirects=True,
+                timeout=60
+            )
+        else:
+            # For other content types, use the original approach
+            body = await request.body()
+            response = requests.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                params=params,
+                data=body,
+                proxies=proxies if HTTP_PROXY else None,
+                stream=True,
+                verify=True,
+                allow_redirects=True,
+                timeout=60
+            )
         
-        # Log response details in debug mode
-        if DEBUG:
-            logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response headers: {dict(response.headers)}")
+        # If the response is streaming, return a streaming response
+        if 'content-encoding' in response.headers or 'transfer-encoding' in response.headers:
+            return StreamingResponse(
+                response.iter_content(chunk_size=8192),
+                status_code=response.status_code,
+                headers=dict(response.headers)
+            )
         
-        # Create a streaming response with the same status code and headers
-        def generate_stream():
-            for chunk in response.iter_content(chunk_size=1024):
-                if DEBUG:
-                    logger.debug(f"Streaming chunk: {len(chunk)} bytes")
-                yield chunk
-        
-        # Create response headers
-        response_headers = {}
-        for key, value in response.headers.items():
-            if key.lower() not in ('content-encoding', 'transfer-encoding', 'content-length'):
-                response_headers[key] = value
-        
-        return StreamingResponse(
-            generate_stream(),
+        # Otherwise, return a regular response
+        return Response(
+            content=response.content,
             status_code=response.status_code,
-            headers=response_headers,
-            media_type=response.headers.get('Content-Type')
+            headers=dict(response.headers)
         )
-        
-    except Exception as e:
+    except requests.RequestException as e:
         logger.error(f"Error proxying request: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error proxying request: {str(e)}")
 
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 8080))
-    host = os.getenv('HOST', '0.0.0.0')
+if __name__ == "__main__":
+    logger.info(f"Starting OpenAI API Proxy on port {PORT}")
+    logger.info(f"Proxying requests to {OPENAI_API_BASE_URL}")
+    if HTTP_PROXY:
+        logger.info(f"Using HTTP proxy: {HTTP_PROXY}")
     
-    logger.info(f"Starting OpenAI API Proxy on {host}:{port}")
-    logger.info(f"Debug mode: {DEBUG}")
-    logger.info(f"Proxy enabled: {PROXY_CONFIG is not None}")
-    
-    uvicorn.run("main:app", host=host, port=port, reload=DEBUG)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
