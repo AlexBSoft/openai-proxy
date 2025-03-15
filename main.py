@@ -12,7 +12,12 @@ from io import BytesIO
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 import asyncio
 import tempfile
-import subprocess
+
+# import subprocess
+# import ffmpeg
+# from urllib.parse import unquote
+from aiogram import Bot
+from aiogram.types import FSInputFile
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +38,8 @@ OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/"
 HTTP_PROXY = os.getenv("HTTP_PROXY")
 PORT = int(os.getenv("PORT", 8080))
 API_BASE_ZAPCAP = os.getenv("API_BASE_ZAPCAP")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHAT_ID_TO_SEND_REELS = os.getenv("TG_CHAT_ID_TO_SEND_REELS")
 # Ensure OPENAI_API_BASE_URL ends with a slash
 if not OPENAI_API_BASE_URL.endswith("/"):
     OPENAI_API_BASE_URL += "/"
@@ -160,8 +167,8 @@ async def elevenlabs_tts_proxy(
     payload = {
         "text": text,
         "model_id": model_id,
-        # "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
-        # "output_format": output_format,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
+        "output_format": output_format,
     }
 
     try:
@@ -259,13 +266,15 @@ async def add_captions(video_path: str, api_key: str, template_id: str) -> Bytes
             raise e
 
 
-@app.post("/upload-video/")
+@app.post("/zapcut/upload-video/")
 async def upload_video(
-    video_url: str,
     template_id: str,
     api_key: str,
+    video_url: str,
 ):
     try:
+
+        logging.info(f"[upload-video]:{video_url}")
         # Скачиваем видео по ссылке
         async with httpx.AsyncClient() as client:
             response = await client.get(video_url)
@@ -285,12 +294,28 @@ async def upload_video(
             processed_video = await add_captions(temp_video_path, api_key, template_id)
         except Exception as e:
             # Логируем ошибку и отправляем сообщение клиенту
-            print(f"Error processing the video: {str(e)}")
+            logging.ERROR(
+                f"Error processing the video: {str(e),e.args,e.__traceback__}"
+            )
             raise HTTPException(
                 status_code=500,
                 detail="Error processing the video. Please try again later.",
             )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
+            temp_file.write(processed_video.getvalue())
+            temp_file_path = temp_file.name  # Сохраняем путь к файлу
 
+        # Отправляем видео в Telegram
+        video_file = FSInputFile(temp_file_path)  # Теперь путь корректный
+        async with Bot(token=TG_BOT_TOKEN) as bot:
+            await bot.send_document(
+                chat_id=int(TG_CHAT_ID_TO_SEND_REELS),
+                caption="Готовое видео 🎥",
+                document=video_file,
+            )
+
+        # Удаляем временный файл после отправки
+        os.remove(temp_file_path)
         # Удаляем временный файл
         os.remove(temp_video_path)
 
@@ -308,8 +333,84 @@ async def upload_video(
         print(f"Error with video processing: {str(e)}")
         raise HTTPException(
             status_code=400,
-            detail="Error downloading or processing the video. Please try again later.",
+            detail=f"Error downloading or processing the video. Please try again later.",
         )
+
+
+# async def run_ffmpeg(*args):
+#     """Запускает FFmpeg асинхронно"""
+#     process = await asyncio.create_subprocess_exec(
+#         "ffmpeg", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+#     )
+#     await process.communicate()  # Дождаться завершения процесса
+
+
+# @app.post("/ffmpeg/process-video/")
+# async def process_video(
+#     video: UploadFile = File(...),
+#     audio: UploadFile = File(...),
+# ):
+#     try:
+#         # Сохраняем видео и аудио во временные файлы
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as video_file:
+#             video_file.write(await video.read())
+#             video_path = video_file.name
+
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as audio_file:
+#             audio_file.write(await audio.read())
+#             audio_path = audio_file.name
+
+#         no_audio_video_path = os.path.join(tempfile.gettempdir(), "no_audio_video.mp4")
+#         final_video_path = os.path.join(tempfile.gettempdir(), "final_video.mp4")
+
+#         try:
+#             # Удаляем аудио из видео (асинхронно)
+#             await run_ffmpeg("-i", video_path, "-an", no_audio_video_path, "-y")
+
+#             # Добавляем новую аудиодорожку (асинхронно)
+#             await run_ffmpeg(
+#                 "-i",
+#                 no_audio_video_path,
+#                 "-i",
+#                 audio_path,
+#                 "-c:v",
+#                 "copy",
+#                 "-c:a",
+#                 "aac",
+#                 final_video_path,
+#                 "-y",
+#             )
+
+#             video_file = FSInputFile(final_video_path)
+#             async with Bot(
+#                 token="8116357102:AAGW7w6gvZFajhqFsH-aSJFBbWWKdKWQWIc"
+#             ) as bot:
+#                 await bot.send_document(
+#                     chat_id=int(-1002255836822),
+#                     caption="Готовое видео 🎥",
+#                     document=video_file,
+#                 )
+#             # Открываем финальное видео и возвращаем его как поток
+#             with open(final_video_path, "rb") as final_video_file:
+#                 final_video = BytesIO(final_video_file.read())
+#         except Exception as e:
+#             print(f"Error during video processing: {str(e)}")
+#             return {"error": f"Error processing video: {str(e)}"}
+
+#         finally:
+#             # Удаляем временные файлы
+#             for file in [video_path, audio_path, no_audio_video_path, final_video_path]:
+#                 if os.path.exists(file):
+#                     os.remove(file)
+
+#         return StreamingResponse(
+#             final_video,
+#             media_type="video/mp4",
+#             headers={"Content-Disposition": "attachment; filename=processed_video.mp4"},
+#         )
+#     except Exception as e:
+#         print(f"Error processing video: {str(e)}")
+#         return {"error": f"Error processing video: {str(e)}"}
 
 
 @app.api_route(
