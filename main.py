@@ -16,8 +16,7 @@ import tempfile
 # import subprocess
 # import ffmpeg
 # from urllib.parse import unquote
-from aiogram import Bot
-from aiogram.types import FSInputFile
+
 
 # Load environment variables
 load_dotenv()
@@ -38,8 +37,7 @@ OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/"
 HTTP_PROXY = os.getenv("HTTP_PROXY")
 PORT = int(os.getenv("PORT", 8080))
 API_BASE_ZAPCAP = os.getenv("API_BASE_ZAPCAP")
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID_TO_SEND_REELS = os.getenv("TG_CHAT_ID_TO_SEND_REELS")
+
 # Ensure OPENAI_API_BASE_URL ends with a slash
 if not OPENAI_API_BASE_URL.endswith("/"):
     OPENAI_API_BASE_URL += "/"
@@ -304,15 +302,6 @@ async def upload_video(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
             temp_file.write(processed_video.getvalue())
             temp_file_path = temp_file.name  # Сохраняем путь к файлу
-
-        # Отправляем видео в Telegram
-        video_file = FSInputFile(temp_file_path)  # Теперь путь корректный
-        async with Bot(token=TG_BOT_TOKEN) as bot:
-            await bot.send_document(
-                chat_id=int(TG_CHAT_ID_TO_SEND_REELS),
-                caption="Готовое видео 🎥",
-                document=video_file,
-            )
 
         # Удаляем временный файл после отправки
         os.remove(temp_file_path)
