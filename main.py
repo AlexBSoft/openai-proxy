@@ -11,11 +11,12 @@ import httpx
 from io import BytesIO
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 import asyncio
-import tempfile
+import traceback
 
+# import tempfile
 # import subprocess
 # import ffmpeg
-# from urllib.parse import unquote
+from urllib.parse import unquote
 
 
 # Load environment variables
@@ -36,8 +37,7 @@ logger = logging.getLogger(__name__)
 OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/")
 HTTP_PROXY = os.getenv("HTTP_PROXY")
 PORT = int(os.getenv("PORT", 8080))
-API_BASE_ZAPCAP = os.getenv("API_BASE_ZAPCAP")
-
+API_BASE_ZAPCAP = "https://api.zapcap.ai"
 # Ensure OPENAI_API_BASE_URL ends with a slash
 if not OPENAI_API_BASE_URL.endswith("/"):
     OPENAI_API_BASE_URL += "/"
@@ -199,69 +199,53 @@ async def elevenlabs_tts_proxy(
         )
 
 
-async def add_captions(video_path: str, api_key: str, template_id: str) -> BytesIO:
-
+async def add_captions(video_path: str, api_key: str, json_data: dict) -> BytesIO:
     async with httpx.AsyncClient() as client:
-
         try:
-            # 1. Upload video
-            print("Uploading video...")
+            logging.info("Uploading video...")
             with open(video_path, "rb") as f:
                 upload_response = await client.post(
-                    f"{API_BASE_ZAPCAP}/videos",
+                    "https://api.zapcap.ai/videos",
                     headers={"x-api-key": api_key},
                     files={"file": f},
                 )
             upload_response.raise_for_status()
             video_id = upload_response.json()["id"]
-            print("Video uploaded, ID:", video_id)
+            logging.info(f"Video uploaded successfully. ID: {video_id}")
 
-            # 2. Create task
-            print("Creating captioning task...")
+            logging.info("Creating captioning task...")
             task_response = await client.post(
-                f"{API_BASE_ZAPCAP}/videos/{video_id}/task",
+                f"https://api.zapcap.ai/videos/{video_id}/task",
                 headers={"x-api-key": api_key, "Content-Type": "application/json"},
-                json={
-                    "templateId": template_id,
-                    "autoApprove": True,
-                    "language": "ru",
-                    "transcribeSettings": {"broll": {"brollPercent": 50}},
-                },
+                json=json_data,
             )
             task_response.raise_for_status()
             task_id = task_response.json()["taskId"]
-            print("Task created, ID:", task_id)
+            logging.info(f"Captioning task created. Task ID: {task_id}")
 
-            # 3. Poll for completion
-            print("Processing video...")
-            attempts = 0
+            logging.info("Processing video...")
             while True:
                 status_response = await client.get(
-                    f"{API_BASE_ZAPCAP}/videos/{video_id}/task/{task_id}",
+                    f"https://api.zapcap.ai/videos/{video_id}/task/{task_id}",
                     headers={"x-api-key": api_key},
                 )
                 status_response.raise_for_status()
                 data = status_response.json()
                 status = data["status"]
-                print("Status:", status)
+                logging.info(f"Task status: {status}")
 
                 if status == "completed":
-                    # Download the video
-                    print("Downloading captioned video...")
+                    logging.info("Downloading captioned video...")
                     download_response = await client.get(data["downloadUrl"])
                     download_response.raise_for_status()
-
-                    # Return the captioned video as a BytesIO object
                     return BytesIO(download_response.content)
                 elif status == "failed":
                     raise Exception(f"Task failed: {data.get('error')}")
 
                 await asyncio.sleep(2)
-                attempts += 1
-
         except Exception as e:
-            print("Error:", str(e))
-            raise e
+            logging.error(f"Error processing video: {e}\n{traceback.format_exc()}")
+            raise
 
 
 @app.post("/zapcut/upload-video/")
@@ -269,11 +253,36 @@ async def upload_video(
     template_id: str,
     api_key: str,
     video_url: str,
+    # emphasize_keywords: Optional[bool] = False,
+    display_words: Optional[int] = 2,
+    top: Optional[int] = 40,
+    font_size: Optional[int] = 14,
+    # font_shadow: Optional[str] = "none",
+    stroke: Optional[str] = "none",
+    emoji: Optional[bool] = False,
 ):
     try:
+        json_data = {
+            "templateId": template_id,
+            "autoApprove": True,
+            "language": "ru",
+            # "transcribeSettings": {"broll": {"brollPercent": 50}},
+            "renderOptions": {
+                "subsOptions": {
+                    # "animation": True,
+                    "emoji": emoji,
+                    # "emphasizeKeywords": emphasize_keywords,
+                    "displayWords": display_words,
+                },
+                "styleOptions": {
+                    "top": top,
+                    "fontSize": font_size,
+                    # "fontShadow": font_shadow,
+                    "stroke": stroke,
+                },
+            },
+        }
 
-        logging.info(f"[upload-video]:{video_url}")
-        # Скачиваем видео по ссылке
         async with httpx.AsyncClient() as client:
             response = await client.get(video_url)
             if response.status_code != 200:
@@ -282,47 +291,90 @@ async def upload_video(
                 )
             video_content = response.content
 
-        # Сохраняем видео временно в файл
         temp_video_path = "temp_video.mp4"
         with open(temp_video_path, "wb") as temp_file:
             temp_file.write(video_content)
 
-        # Обрабатываем видео, добавляя субтитры
         try:
-            processed_video = await add_captions(temp_video_path, api_key, template_id)
-        except Exception as e:
-            # Логируем ошибку и отправляем сообщение клиенту
-            logging.ERROR(
-                f"Error processing the video: {str(e),e.args,e.__traceback__}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Error processing the video. Please try again later.",
-            )
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
-            temp_file.write(processed_video.getvalue())
-            temp_file_path = temp_file.name  # Сохраняем путь к файлу
+            processed_video = await add_captions(temp_video_path, api_key, json_data)
+        finally:
+            os.remove(temp_video_path)
 
-        # Удаляем временный файл после отправки
-        os.remove(temp_file_path)
-        # Удаляем временный файл
-        os.remove(temp_video_path)
-
-        # Возвращаем обработанное видео в виде потока
         return StreamingResponse(
-            processed_video,  # Используем сам BytesIO объект
+            processed_video,
             media_type="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename=captioned_video.mp4"
-            },
+            headers={"Content-Disposition": "attachment; filename=captioned_video.mp4"},
+        )
+    except Exception as e:
+        logging.error(f"Error processing video: {e}\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error processing the video. Please try again later.",
         )
 
+
+@app.post("/zapcut/upload-broll/")
+async def upload_video(
+    template_id: str,
+    api_key: str,
+    video_url: str,
+    # emphasize_keywords: Optional[bool] = False,
+    display_words: Optional[int] = 2,
+    top: Optional[int] = 40,
+    font_size: Optional[int] = 14,
+    # font_shadow: Optional[str] = "none",
+    stroke: Optional[str] = "none",
+    emoji: Optional[bool] = False,
+):
+    try:
+        json_data = {
+            "templateId": template_id,
+            "autoApprove": True,
+            "language": "ru",
+            "transcribeSettings": {"broll": {"brollPercent": 50}},
+            "renderOptions": {
+                "subsOptions": {
+                    # "animation": True,
+                    "emoji": emoji,
+                    # "emphasizeKeywords": emphasize_keywords,
+                    "displayWords": display_words,
+                },
+                "styleOptions": {
+                    "top": top,
+                    "fontSize": font_size,
+                    # "fontShadow": font_shadow,
+                    "stroke": stroke,
+                },
+            },
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(video_url)
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=404, detail="Video not found at the provided URL."
+                )
+            video_content = response.content
+
+        temp_video_path = "temp_video.mp4"
+        with open(temp_video_path, "wb") as temp_file:
+            temp_file.write(video_content)
+
+        try:
+            processed_video = await add_captions(temp_video_path, api_key, json_data)
+        finally:
+            os.remove(temp_video_path)
+
+        return StreamingResponse(
+            processed_video,
+            media_type="video/mp4",
+            headers={"Content-Disposition": "attachment; filename=captioned_video.mp4"},
+        )
     except Exception as e:
-        # Ловим все исключения при загрузке видео
-        print(f"Error with video processing: {str(e)}")
+        logging.error(f"Error processing video: {e}\n{traceback.format_exc()}")
         raise HTTPException(
-            status_code=400,
-            detail=f"Error downloading or processing the video. Please try again later.",
+            status_code=500,
+            detail="Error processing the video. Please try again later.",
         )
 
 
